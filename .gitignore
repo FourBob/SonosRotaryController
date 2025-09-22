@@ -1,0 +1,14 @@
+# Ignore local WiFi secrets
+src/secrets.h
+
+
+
+# PlatformIO build artifacts
+.pio/
+.pioenvs/
+.pio/build/
+
+# IDE and OS junk
+.vscode/
+.DS_Store
+.idea/
