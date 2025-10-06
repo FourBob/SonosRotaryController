@@ -32,11 +32,54 @@
 #include <Fonts/FreeSansBold24pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 
-#include <Fonts/FreeSansBold12pt7b.h>
-#include <cstring>
-#include "esp_heap_caps.h"
+// === PERFORMANCE CONSTANTS ===
+// Display dimensions
+static constexpr int DISPLAY_WIDTH = 480;
+static constexpr int DISPLAY_HEIGHT = 480;
+static constexpr int DISPLAY_CENTER_X = DISPLAY_WIDTH / 2;
+static constexpr int DISPLAY_CENTER_Y = DISPLAY_HEIGHT / 2;
+
+// HTTP timeouts (milliseconds)
+static constexpr int HTTP_TIMEOUT_SHORT = 1200;   // Quick operations
+static constexpr int HTTP_TIMEOUT_MEDIUM = 5000;  // Normal operations
+static constexpr int HTTP_TIMEOUT_LONG = 15000;   // Downloads
+
+// Polling intervals (milliseconds)
+static constexpr int SONOS_POLL_INTERVAL = 1000;
+static constexpr int MEMORY_LOG_INTERVAL = 5000;
+static constexpr int ROOM_SCAN_INTERVAL = 30000;
+static constexpr int UI_REFRESH_INTERVAL = 1000;
+
+// Button timing
+static constexpr int BTN_LONG_PRESS_MS = 1000;
+static constexpr int BTN_DEBOUNCE_MS = 50;
+
+// UI Layout constants
+static constexpr int BTN_HEIGHT = 90;
+static constexpr int BTN_WIDTH = DISPLAY_WIDTH / 3; // 160px
+static constexpr int PROGRESS_WIDTH = 400;
+static constexpr int PROGRESS_HEIGHT = 12;
+static constexpr int PROGRESS_Y = DISPLAY_HEIGHT - BTN_HEIGHT - 30;
+static constexpr int PROGRESS_X = (DISPLAY_WIDTH - PROGRESS_WIDTH) / 2;
+
+// Memory allocation sizes
+static constexpr size_t ALBUM_FB_SIZE = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
+static constexpr size_t HTTP_CHUNK_SIZE = 2048;
+
+// === TOUCH FEEDBACK CONSTANTS ===
+// Touch feedback timing (milliseconds)
+static constexpr int TOUCH_FEEDBACK_DURATION = 150;    // How long to show touch feedback
+static constexpr int TOUCH_RIPPLE_DURATION = 300;      // Ripple animation duration
+static constexpr int BUTTON_PRESS_DURATION = 100;      // Button press visual feedback
+
+// Touch feedback colors
+static constexpr uint16_t TOUCH_HIGHLIGHT_COLOR = 0x39E7;  // Light blue highlight
+static constexpr uint16_t BUTTON_PRESSED_COLOR = 0x2945;   // Darker blue for pressed state
+static constexpr uint16_t RIPPLE_COLOR = 0x4A69;          // Semi-transparent ripple
+static constexpr uint16_t VOLUME_HIGHLIGHT_COLOR = 0x07E0; // Green for volume feedback
 
 #include <Fonts/FreeSansBold12pt7b.h>
+#include <cstring>
 #include <PNGdec.h>
 #include <TJpg_Decoder.h>
 #include <FS.h>
@@ -53,14 +96,13 @@
 #include "sonos.h"
 #include "discovery.h"
 
-#include "logging.h"
 #include "release_notes.h"
 
 extern Arduino_RGB_Display *gfx; // forward declaration for png draw callback
 static PNG g_png;
 static int g_png_draw_x = 0, g_png_draw_y = 0;
-static uint16_t g_png_linebuf[480]; // max display width
-static uint8_t  g_png_mask[480];    // alpha mask buffer (1 byte per pixel)
+static uint16_t g_png_linebuf[DISPLAY_WIDTH]; // max display width
+static uint8_t  g_png_mask[DISPLAY_WIDTH];    // alpha mask buffer (1 byte per pixel)
 static int pngDraw(PNGDRAW *p)
 {
   // For icons with alpha: draw with per-pixel mask
@@ -76,7 +118,7 @@ static int g_png_scale = 1;
 static int g_png_out_w = 0, g_png_out_h = 0;
 static int g_png_center_dx = 0, g_png_center_dy = 0;
 static uint16_t g_png_srcbuf[800];      // supports up to 800px wide PNG input lines
-static uint16_t g_png_scaled_line[480]; // output line up to display width
+static uint16_t g_png_scaled_line[DISPLAY_WIDTH]; // output line up to display width
 
 static int pngDrawAlbum(PNGDRAW *p)
 {
@@ -89,7 +131,7 @@ static int pngDrawAlbum(PNGDRAW *p)
 
   // Horizontal downsample
   int out_w = p->iWidth / g_png_scale;
-  if (out_w > 480) out_w = 480;
+  if (out_w > DISPLAY_WIDTH) out_w = DISPLAY_WIDTH;
   for (int i = 0; i < out_w; ++i) {
     int sx = i * g_png_scale;
     if (sx >= p->iWidth) sx = p->iWidth - 1;
@@ -98,7 +140,7 @@ static int pngDrawAlbum(PNGDRAW *p)
 
   // Compute destination Y (downsampled) and draw
   int y_out = g_png_center_dy + (p->y / g_png_scale);
-  if (y_out >= 0 && y_out < 480) {
+  if (y_out >= 0 && y_out < DISPLAY_HEIGHT) {
     gfx->draw16bitRGBBitmap(g_png_center_dx, y_out, g_png_scaled_line, out_w, 1);
   }
   return 1;
@@ -122,18 +164,18 @@ static uint32_t g_tjpg_blk_clipped = 0;
 static bool g_fg_center_crop = false;
 static int g_fg_src_w = 0, g_fg_src_h = 0;
 static int g_fg_src_x0 = 0, g_fg_src_y0 = 0; // source crop origin
-static int g_fg_dst_x0 = 0, g_fg_dst_y0 = 0; // destination origin within 480x480
+static int g_fg_dst_x0 = 0, g_fg_dst_y0 = 0; // destination origin within display
 static int g_fg_crop_w = 0, g_fg_crop_h = 0; // crop size
 
 static bool tjpg_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap)
 {
   if (w == 0 || h == 0) return true; // skip empty block but continue decode
   if (!g_fg_center_crop) {
-    if (x >= 480 || y >= 480) return true; // completely off-screen -> continue decode
+    if (x >= DISPLAY_WIDTH || y >= DISPLAY_HEIGHT) return true; // completely off-screen -> continue decode
     uint16_t cw = w, ch = h;
     bool clipped = false;
-    if (x + cw > 480) { cw = 480 - x; clipped = true; }
-    if (y + ch > 480) { ch = 480 - y; clipped = true; }
+    if (x + cw > DISPLAY_WIDTH) { cw = DISPLAY_WIDTH - x; clipped = true; }
+    if (y + ch > DISPLAY_HEIGHT) { ch = DISPLAY_HEIGHT - y; clipped = true; }
     if (cw == 0 || ch == 0) return true; // nothing to draw, but keep going
     if (g_albumart_log_verbose) {
       uint32_t n = g_tjpg_blk + 1;
@@ -191,9 +233,9 @@ static int jpegdec_draw_cb(JPEGDRAW *p)
   int w = (p->iWidthUsed > 0) ? p->iWidthUsed : p->iWidth;
   int h = p->iHeight;
   if (w <= 0 || h <= 0) return 1;
-  if (x >= 480 || y >= 480) return 1;
-  if (x + w > 480) w = 480 - x;
-  if (y + h > 480) h = 480 - y;
+  if (x >= DISPLAY_WIDTH || y >= DISPLAY_HEIGHT) return 1;
+  if (x + w > DISPLAY_WIDTH) w = DISPLAY_WIDTH - x;
+  if (y + h > DISPLAY_HEIGHT) h = DISPLAY_HEIGHT - y;
   if (w <= 0 || h <= 0) return 1;
   gfx->draw16bitRGBBitmap(x, y, p->pPixels, w, h);
   return 1;
@@ -202,7 +244,6 @@ static int jpegdec_draw_cb(JPEGDRAW *p)
 
 // Album art background job state (must be before task/function use)
 static volatile bool g_album_job_busy = false;
-static volatile bool g_album_frame_ready = false; // legacy (unused in new path)
 static volatile bool g_album_file_ready = false;  // new: file downloaded and ready to decode on main thread
 static TaskHandle_t g_album_task = nullptr;
 
@@ -220,7 +261,7 @@ static volatile bool g_album_fg_busy = false;
 static volatile int  g_album_fg_result = -1; // -1: none, 0: fail, 1: ok
 static TaskHandle_t  g_album_fg_task = nullptr;
 static volatile bool g_album_fg_ready = false;
-static uint16_t* g_album_fg_fb = nullptr; // 480x480 RGB565
+static uint16_t* g_album_fg_fb = nullptr; // DISPLAY_WIDTH x DISPLAY_HEIGHT RGB565
 static void albumart_fg_worker(void* arg) {
   const char* path = "/album.bin";
   std::vector<uint8_t> jpg;
@@ -252,11 +293,11 @@ static void albumart_fg_worker(void* arg) {
   unsigned long t0 = millis();
   if (!jpg.empty()) {
     if (!g_album_fg_fb) {
-      g_album_fg_fb = (uint16_t*) heap_caps_malloc(480*480*sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-      if (!g_album_fg_fb) g_album_fg_fb = (uint16_t*) malloc(480*480*sizeof(uint16_t));
+      g_album_fg_fb = (uint16_t*) heap_caps_malloc(ALBUM_FB_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (!g_album_fg_fb) g_album_fg_fb = (uint16_t*) malloc(ALBUM_FB_SIZE);
     }
     if (!g_album_fg_fb) {
-      Serial.println("AlbumArt: fg alloc 480x480 failed");
+      Serial.printf("AlbumArt: fg alloc %dx%d failed\n", DISPLAY_WIDTH, DISPLAY_HEIGHT);
     } else {
       ok = albumart::AlbumArtService::decodeToCropped480(jpg.data(), jpg.size(), g_album_fg_fb);
     }
@@ -278,17 +319,18 @@ static uint16_t* g_jpg_fb = nullptr;
 static int g_jpg_fb_w = 0, g_jpg_fb_h = 0;
 
 
-// Background album-art compositing state
-static uint16_t* g_bg_fb = nullptr;          // 480x480 RGB565 framebuffer in PSRAM
-static volatile bool g_bg_ready = false;      // true when g_bg_fb contains a valid image
+// Background album-art compositing state (LEGACY - TO BE REMOVED)
+// NOTE: These variables are now handled by the modular BackgroundArt class
+// static uint16_t* g_bg_fb = nullptr;          // DISPLAY_WIDTH x DISPLAY_HEIGHT RGB565 framebuffer in PSRAM
+// static volatile bool g_bg_ready = false;      // true when g_bg_fb contains a valid image
 static volatile bool g_bg_decode_busy = false;// worker is decoding/building g_bg_fb
-static int g_bg_blit_row = 0;                 // next row to blit to panel (striped)
+// static int g_bg_blit_row = 0;                 // next row to blit to panel (striped)
 static String g_bg_url;  // Background album art URL (Sonos albumArtURI)
 static bool   g_bg_need_start = false; // schedule start when URL changes while busy
 
 
 static void draw_player_background_step();    // forward decl
-static void album_bg_start_fixed_url();       // forward decl
+// Legacy album_bg_start_fixed_url forward decl removed
 
 // TJpg_Decoder callback: copy block into g_jpg_fb (RGB565)
 static bool tjpg_out_to_fb(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap)
@@ -310,37 +352,9 @@ static bool tjpg_out_to_fb(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_
 // TJpg_Decoder direct-to-background callback with center crop/pad (no temp fb)
 static int g_tjpg_src_w = 0, g_tjpg_src_h = 0;
 static int g_tjpg_src_x0 = 0, g_tjpg_src_y0 = 0; // source crop origin
-static int g_tjpg_dst_x0 = 0, g_tjpg_dst_y0 = 0; // destination origin within 480x480
+static int g_tjpg_dst_x0 = 0, g_tjpg_dst_y0 = 0; // destination origin within display
 static int g_tjpg_crop_w = 0, g_tjpg_crop_h = 0; // width/height of content to place
-static bool tjpg_out_to_bg(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap)
-{
-  if (!g_bg_fb || w == 0 || h == 0) return true;
-  // Intersection of current block with source crop window
-  int src_x0 = g_tjpg_src_x0, src_y0 = g_tjpg_src_y0;
-  int src_x1 = src_x0 + g_tjpg_crop_w;
-  int src_y1 = src_y0 + g_tjpg_crop_h;
-
-  int bx0 = x, by0 = y;
-  int bx1 = bx0 + (int)w;
-  int by1 = by0 + (int)h;
-
-  int ix0 = (bx0 > src_x0) ? bx0 : src_x0;
-  int iy0 = (by0 > src_y0) ? by0 : src_y0;
-  int ix1 = (bx1 < src_x1) ? bx1 : src_x1;
-  int iy1 = (by1 < src_y1) ? by1 : src_y1;
-  if (ix0 >= ix1 || iy0 >= iy1) return true; // no overlap
-
-  int copy_w = ix1 - ix0;
-  for (int yy = iy0; yy < iy1; ++yy) {
-    int src_row_off = (yy - by0) * (int)w + (ix0 - bx0);
-    const uint16_t* src = bitmap + src_row_off;
-    int dst_x = g_tjpg_dst_x0 + (ix0 - src_x0);
-    int dst_y = g_tjpg_dst_y0 + (yy - src_y0);
-    uint16_t* dst = &g_bg_fb[dst_y * 480 + dst_x];
-    memcpy(dst, src, (size_t)copy_w * sizeof(uint16_t));
-  }
-  return true;
-}
+// Legacy tjpg_out_to_bg function removed - replaced by modular BackgroundArt system
 
 
 static int jpegdec_draw_to_fb(JPEGDRAW *p)
@@ -406,7 +420,7 @@ static void jpegdec_worker(void* arg)
     j.setPixelType(RGB565_LITTLE_ENDIAN);
     int jw = j.getWidth();
     int jh = j.getHeight();
-    int jscale = 0; while (((jw >> jscale) > 480 || (jh >> jscale) > 480) && jscale < 3) jscale++;
+    int jscale = 0; while (((jw >> jscale) > DISPLAY_WIDTH || (jh >> jscale) > DISPLAY_HEIGHT) && jscale < 3) jscale++;
     if (jscale == 0 && (jw > 320 || jh > 320)) jscale = 1; // force half-scale for >320px to reduce stack/memory
     int out_w = jw >> jscale;
     int out_h = jh >> jscale;
@@ -462,9 +476,11 @@ static void albumart_bg_task(void* arg)
   vTaskDelete(NULL);
 }
 
-// Decode file in background and prepare 480x480 center-cropped background framebuffer
-static void album_bg_decode_task(void* arg)
-{
+// Legacy album_bg_decode_task function removed - replaced by modular BackgroundArt system
+// static void album_bg_decode_task(void* arg)
+// {
+  // Legacy function body commented out - replaced by modular BackgroundArt system
+  /*
   g_bg_decode_busy = true;
   char bg_reason[128]; strncpy(bg_reason, "unknown", sizeof(bg_reason));
 
@@ -487,209 +503,22 @@ static void album_bg_decode_task(void* arg)
 
     fi.close();
   }
-  // Prepare clean bg fb
-  if (g_bg_fb) { heap_caps_free(g_bg_fb); g_bg_fb = nullptr; }
-  g_bg_fb = (uint16_t*) heap_caps_malloc(480*480*sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  // ... rest of function body ...
+  */
 
-  if (!g_bg_fb) g_bg_fb = (uint16_t*) heap_caps_malloc(480*480*sizeof(uint16_t), MALLOC_CAP_8BIT);
-  if (!g_bg_fb) g_bg_fb = (uint16_t*) malloc(480*480*sizeof(uint16_t));
-  if (g_bg_fb) memset(g_bg_fb, 0x00, 480*480*sizeof(uint16_t)); // black
-
-  // Decode file (prefer native format): if PNG, use PNGdec; else JPEGDEC; then compose center crop/pad into 480x480
-  if (!jpg.empty() && g_bg_fb) {
-    // Clear any previous decoded fb
-    if (g_jpg_fb) { heap_caps_free(g_jpg_fb); g_jpg_fb = nullptr; g_jpg_fb_w = g_jpg_fb_h = 0; }
-
-    bool is_png = (jpg.size() >= 8 && jpg[0]==0x89 && jpg[1]==0x50 && jpg[2]==0x4E && jpg[3]==0x47 && jpg[4]==0x0D && jpg[5]==0x0A && jpg[6]==0x1A && jpg[7]==0x0A);
-    bool is_jpeg = (jpg.size() >= 2 && jpg[0]==0xFF && jpg[1]==0xD8);
-    Serial.printf("AlbumArt(bg): detect type -> %s\n", is_png?"PNG":(is_jpeg?"JPEG":"unknown"));
-
-    if (is_png) {
-      if (g_png.openRAM(jpg.data(), jpg.size(), png_out_to_fb) == PNG_SUCCESS) {
-
-        int pw = g_png.getWidth();
-        int ph = g_png.getHeight();
-        size_t fb_bytes = (size_t)pw * (size_t)ph * sizeof(uint16_t);
-        g_jpg_fb = (uint16_t*) heap_caps_malloc(fb_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!g_jpg_fb) g_jpg_fb = (uint16_t*) heap_caps_malloc(fb_bytes, MALLOC_CAP_8BIT);
-        if (!g_jpg_fb) g_jpg_fb = (uint16_t*) malloc(fb_bytes);
-        if (g_jpg_fb) {
-          g_jpg_fb_w = pw; g_jpg_fb_h = ph;
-          int prc = g_png.decode(NULL, 0);
-          g_png.close();
-          if (prc == PNG_SUCCESS) {
-            // Compose center crop/pad into 480x480
-            int sw = g_jpg_fb_w, sh = g_jpg_fb_h;
-            int src_x0 = (sw > 480) ? (sw - 480)/2 : 0;
-            int src_y0 = (sh > 480) ? (sh - 480)/2 : 0;
-            int copy_w = (sw > 480) ? 480 : sw;
-            int copy_h = (sh > 480) ? 480 : sh;
-            int dst_x0 = (sw < 480) ? (480 - sw)/2 : 0;
-            int dst_y0 = (sh < 480) ? (480 - sh)/2 : 0;
-            for (int row = 0; row < copy_h; ++row) {
-              const uint16_t* src = &g_jpg_fb[(src_y0 + row) * sw + src_x0];
-              uint16_t* dst = &g_bg_fb[(dst_y0 + row) * 480 + dst_x0];
-              memcpy(dst, src, (size_t)copy_w * sizeof(uint16_t));
-            }
-            g_bg_blit_row = 0;
-            g_bg_ready = true;
-            Serial.printf("AlbumArt(bg): background ready (PNG) %dx%d\n", sw, sh);
-          } else {
-            Serial.println("AlbumArt(bg): PNG decode failed");
-            strncpy(bg_reason, "PNG decode failed", sizeof(bg_reason));
-          }
-          heap_caps_free(g_jpg_fb); g_jpg_fb = nullptr; g_jpg_fb_w = g_jpg_fb_h = 0;
-        } else {
-          g_png.close();
-          Serial.println("AlbumArt(bg): alloc png_fb failed");
-          strncpy(bg_reason, "alloc png_fb failed", sizeof(bg_reason));
-        }
-      } else {
-        Serial.println("AlbumArt(bg): PNG open failed");
-        strncpy(bg_reason, "PNG open failed", sizeof(bg_reason));
-      }
-    } else {
-      // JPEG path via TJpg_Decoder streaming from file with center-crop/pad
-      uint16_t tw=0, th=0;
-      if (TJpgDec.getJpgSize(&tw, &th, jpg.data(), jpg.size()) == JDR_OK) {
-        // Compute center-crop/pad mapping
-        g_tjpg_src_w = (int)tw; g_tjpg_src_h = (int)th;
-        g_tjpg_crop_w = (tw > 480) ? 480 : (int)tw;
-        g_tjpg_crop_h = (th > 480) ? 480 : (int)th;
-        g_tjpg_src_x0 = (tw > 480) ? (((int)tw - 480) / 2) : 0;
-        g_tjpg_src_y0 = (th > 480) ? (((int)th - 480) / 2) : 0;
-        g_tjpg_dst_x0 = (tw < 480) ? ((480 - (int)tw) / 2) : 0;
-        g_tjpg_dst_y0 = (th < 480) ? ((480 - (int)th) / 2) : 0;
-        // Decode directly from file; keep RAM copy for progressive JPEG fallback
-        // jpg.clear(); jpg.shrink_to_fit();
-        for (int i = 0; i < 480 * 480; ++i) g_bg_fb[i] = 0; // padding areas to black
-        TJpgDec.setSwapBytes(false);
-        TJpgDec.setCallback(tjpg_out_to_bg);
-        bool ok = TJpgDec.drawJpg(0, 0, jpg.data(), jpg.size()); // decode from RAM buffer (more robust on ESP32)
-        if (ok) {
-          g_bg_blit_row = 0;
-          g_bg_ready = true;
-          Serial.printf("AlbumArt(bg): background ready (TJpg-file) %ux%u\n", tw, th);
-        } else {
-          Serial.println("AlbumArt(bg): TJpg decode failed");
-          strncpy(bg_reason, "TJpg decode failed", sizeof(bg_reason));
-        }
-      } else {
-        Serial.println("AlbumArt(bg): TJpg getJpgSize failed");
-        strncpy(bg_reason, "TJpg getJpgSize failed", sizeof(bg_reason));
-      }
-    }
-  }
-  // Disable TJpg fallback for this test: force JPEGDEC-only
-  if (false && !g_bg_ready && !jpg.empty()) {
-    Serial.println("AlbumArt(bg): JPEG path not ready -> trying TJpg");
-    if (strncmp(bg_reason, "unknown", 7) == 0) strncpy(bg_reason, "JPEGDEC failed", sizeof(bg_reason));
-  }
-
+  // Rest of legacy function body commented out
+  /*
   if (false && !g_bg_ready && g_bg_fb && !jpg.empty()) {
-    uint16_t tw=0, th=0;
-    if (TJpgDec.getJpgSize(&tw, &th, jpg.data(), jpg.size()) == JDR_OK) {
-      // Compute center-crop/pad mapping
-      g_tjpg_src_w = (int)tw; g_tjpg_src_h = (int)th;
-      g_tjpg_crop_w = (tw > 480) ? 480 : (int)tw;
-      g_tjpg_crop_h = (th > 480) ? 480 : (int)th;
-      g_tjpg_src_x0 = (tw > 480) ? (((int)tw - 480) / 2) : 0;
-      g_tjpg_src_y0 = (th > 480) ? (((int)th - 480) / 2) : 0;
-      g_tjpg_dst_x0 = (tw < 480) ? ((480 - (int)tw) / 2) : 0;
-      g_tjpg_dst_y0 = (th < 480) ? ((480 - (int)th) / 2) : 0;
-      // Free RAM copy before decode to reduce heap pressure, decode directly from file
-      // keep RAM copy for progressive JPEG fallback via JPEGDEC
-      for (int i = 0; i < 480 * 480; ++i) g_bg_fb[i] = 0; // padding areas to black
-      TJpgDec.setSwapBytes(false);
-      TJpgDec.setCallback(tjpg_out_to_bg);
-      bool ok = TJpgDec.drawJpg(0, 0, jpg.data(), jpg.size()); // decode from RAM buffer (more robust on ESP32)
-      if (ok) {
-        g_bg_blit_row = 0;
-        g_bg_ready = true;
-        Serial.printf("AlbumArt(bg): background ready (TJpg-file) %ux%u\n", tw, th);
-      } else {
-        Serial.println("AlbumArt(bg): TJpg decode failed");
-        strncpy(bg_reason, "TJpg decode failed", sizeof(bg_reason));
-      }
-    } else {
-      Serial.println("AlbumArt(bg): TJpg getJpgSize failed");
-      strncpy(bg_reason, "TJpg getJpgSize failed", sizeof(bg_reason));
-    }
+    // ... rest of function body ...
   }
-
-  // Fallback for progressive JPEGs: use JPEGDEC from RAM copy
-  if (!g_bg_ready && !jpg.empty()) {
-    JPEGDEC j;
-    if (j.openRAM((uint8_t*)jpg.data(), (int)jpg.size(), jpegdec_draw_to_fb) == JPEG_SUCCESS) {
-      j.setPixelType(RGB565_LITTLE_ENDIAN);
-      int jw = j.getWidth();
-      int jh = j.getHeight();
-      int out_w = jw, out_h = jh;
-      size_t fb_bytes = (size_t)out_w * (size_t)out_h * sizeof(uint16_t);
-      g_jpg_fb = (uint16_t*) heap_caps_malloc(fb_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-      if (!g_jpg_fb) g_jpg_fb = (uint16_t*) heap_caps_malloc(fb_bytes, MALLOC_CAP_8BIT);
-      if (!g_jpg_fb) g_jpg_fb = (uint16_t*) malloc(fb_bytes);
-      if (g_jpg_fb) {
-        g_jpg_fb_w = out_w; g_jpg_fb_h = out_h;
-        (void)j.decode(0, 0, 0);
-        j.close();
-        int sw = g_jpg_fb_w, sh = g_jpg_fb_h;
-        int src_x0 = (sw > 480) ? (sw - 480)/2 : 0;
-        int src_y0 = (sh > 480) ? (sh - 480)/2 : 0;
-        int copy_w = (sw > 480) ? 480 : sw;
-        int copy_h = (sh > 480) ? 480 : sh;
-        int dst_x0 = (sw < 480) ? (480 - sw)/2 : 0;
-        int dst_y0 = (sh < 480) ? (480 - sh)/2 : 0;
-        for (int row = 0; row < copy_h; ++row) {
-          const uint16_t* src = &g_jpg_fb[(src_y0 + row) * sw + src_x0];
-          uint16_t* dst = &g_bg_fb[(dst_y0 + row) * 480 + dst_x0];
-          memcpy(dst, src, (size_t)copy_w * sizeof(uint16_t));
-        }
-        g_bg_blit_row = 0;
-        g_bg_ready = true;
-        Serial.println("AlbumArt(bg): background ready (JPEGDEC progressive fallback)");
-      } else {
-        j.close();
-        Serial.println("AlbumArt(bg): alloc jpg_fb failed (fallback)");
-        strncpy(bg_reason, "alloc jpg_fb failed (fallback)", sizeof(bg_reason));
-      }
-    } else {
-      Serial.println("AlbumArt(bg): JPEGDEC openRAM failed (fallback)");
-      strncpy(bg_reason, "JPEGDEC openRAM failed (fallback)", sizeof(bg_reason));
-    }
-    if (g_jpg_fb) { heap_caps_free(g_jpg_fb); g_jpg_fb = nullptr; g_jpg_fb_w = g_jpg_fb_h = 0; }
-  }
-
-
-  // Fallback: if decode failed, show a subtle gray gradient so we see the path works
-  if (!g_bg_ready && g_bg_fb) {
-    for (int y = 0; y < 480; ++y) {
-      uint8_t v = (uint8_t)(32 + (y * 192 / 479)); // 32..224
-      uint16_t c = ((v >> 3) << 11) | ((v >> 2) << 5) | (v >> 3);
-      for (int x = 0; x < 480; ++x) g_bg_fb[y*480 + x] = c;
-    }
-    g_bg_blit_row = 0;
-    g_bg_ready = true;
-    Serial.printf("AlbumArt(bg): fallback gradient shown (reason: %s)\n", bg_reason);
-  }
-
+  // ... more function body ...
   g_bg_decode_busy = false;
   vTaskDelete(NULL);
-}
+  */
+// }
 
-static void album_bg_start_fixed_url()
-{
-  if (g_album_job_busy) return;
-  g_album_job_busy = true;
-
-  g_album_file_ready = false;
-  g_bg_ready = false;
-  g_bg_blit_row = 0;
-
-  // Start download worker
-
-  xTaskCreatePinnedToCore(albumart_bg_task, "aa_bg", 8192, nullptr, tskIDLE_PRIORITY+1, &g_album_task, 0);
-}
+// Legacy album_bg_start_fixed_url function removed - replaced by modular BackgroundArt system
+// static void album_bg_start_fixed_url() { ... }
 
 static albumart::BackgroundArt g_bg_mgr;
 
@@ -741,7 +570,7 @@ Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
     1 /* vsync_polarity */, 10 /* vsync_front_porch */, 8 /* vsync_pulse_width */, 20 /* vsync_back_porch */);
 
 Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
-    480 /* width */, 480 /* height */, rgbpanel, 0 /* rotation */, true /* auto_flush */,
+    DISPLAY_WIDTH, DISPLAY_HEIGHT, rgbpanel, 0 /* rotation */, true /* auto_flush */,
     bus, GFX_NOT_DEFINED /* RST */, st7701_type5_init_operations, sizeof(st7701_type5_init_operations));
 // --- WiFi / Time helpers --------------------------------------------------
 bool g_wifi_ok = false;
@@ -762,7 +591,7 @@ static String   g_title_line1 = "";
 static String   g_title_line2 = "";
 
 // --- Screens / Config menu state ----------------------------------------
-enum ScreenMode { SCREEN_PLAYER = 0, SCREEN_CONFIG = 1, SCREEN_CONFIG_BRIGHTNESS = 2, SCREEN_CONFIG_ROOM = 3, SCREEN_CONFIG_ABOUT = 4, SCREEN_CONFIG_ALBUM = 5 };
+enum ScreenMode { SCREEN_PLAYER = 0, SCREEN_CONFIG = 1, SCREEN_CONFIG_BRIGHTNESS = 2, SCREEN_CONFIG_ROOM = 3, SCREEN_CONFIG_TITLE_INFO = 4, SCREEN_CONFIG_SYSTEM_INFO = 5, SCREEN_CONFIG_ABOUT = 6 };
 static ScreenMode g_screen = SCREEN_PLAYER;
 static bool     g_config_ui_inited = false;
 static int      g_menu_sel = 0;
@@ -787,12 +616,27 @@ static bool     g_about_ui_inited = false;
 static int      g_about_scroll_y = 0;    // vertical offset for scrolling content
 static unsigned long g_about_last_scroll = 0;
 
+static bool     g_title_info_ui_inited = false;
+static bool     g_system_info_ui_inited = false;
+
 // Global button state (short vs long press)
 static int  g_btn_prev_global = 0;      // 0=released, 1=pressed
 static unsigned long g_btn_down_since = 0;
 static bool g_btn_long_handled = false; // to fire long action once per hold
 static bool g_btn_short_released = false; // edge event: short tap released
 static const unsigned long BTN_LONG_MS = 800; // long press threshold (ms)
+
+// === TOUCH FEEDBACK STATE ===
+struct TouchFeedback {
+  bool active = false;
+  int x = 0, y = 0;
+  unsigned long start_time = 0;
+  int button_segment = -1;  // Which button was pressed (0=prev, 1=play, 2=next, -1=none)
+  bool is_volume = false;   // Volume icon feedback
+  bool is_menu_item = false; // Config menu item feedback
+  int menu_item_index = -1;  // Which menu item was touched
+};
+static TouchFeedback g_touch_feedback;
 
 // LEDC (PWM) config for TFT backlight
 static const int BL_CH   = 7;     // use a free LEDC channel
@@ -804,6 +648,19 @@ static void backlight_init() {
   // Arduino-ESP32 v3 API: pin-based attach
   ledcAttach(TFT_BL, BL_FREQ, BL_RES);
   backlight_set(g_brightness_pct);
+}
+
+// === TOUCH FEEDBACK FUNCTIONS ===
+static void start_touch_feedback(int x, int y, int button_segment = -1, bool is_volume = false, bool is_menu_item = false, int menu_item_index = -1) {
+  // DISABLED: Touch feedback causing system freeze
+  // TODO: Implement safer touch feedback without UI conflicts
+  return;
+}
+
+static void draw_touch_feedback() {
+  // DISABLED: Touch feedback causing system freeze
+  // TODO: Implement safer touch feedback without UI conflicts
+  return;
 }
 static void backlight_set(int pct) {
   if (pct < 0) pct = 0; if (pct > 100) pct = 100;
@@ -839,8 +696,8 @@ static void draw_center_text(const char *msg, uint16_t color = WHITE, uint16_t b
   gfx->setTextWrap(false);
   int16_t bx, by; uint16_t bw, bh;
   gfx->getTextBounds(msg, 0, 0, &bx, &by, &bw, &bh);
-  int16_t x = (480 - (int)bw) / 2;
-  int16_t y = (480 + (int)bh) / 2; // baseline
+  int16_t x = (DISPLAY_WIDTH - (int)bw) / 2;
+  int16_t y = (DISPLAY_HEIGHT + (int)bh) / 2; // baseline
   gfx->setCursor(x, y);
   gfx->print(msg);
 }
@@ -853,8 +710,8 @@ static void draw_center_text_smooth(const char *msg, uint16_t color = WHITE, con
   gfx->setTextWrap(false);
   int16_t bx, by; uint16_t bw, bh;
   gfx->getTextBounds(msg, 0, 0, &bx, &by, &bw, &bh);
-  int16_t x = (480 - (int)bw) / 2;
-  int16_t y = (480 + (int)bh) / 2; // baseline
+  int16_t x = (DISPLAY_WIDTH - (int)bw) / 2;
+  int16_t y = (DISPLAY_HEIGHT + (int)bh) / 2; // baseline
   int16_t tlx = x + bx;
   int16_t tly = y + by;
   const int pad = 4; // inflate clear area to avoid left-over pixels
@@ -863,8 +720,8 @@ static void draw_center_text_smooth(const char *msg, uint16_t color = WHITE, con
     // First draw: clear just the area where text will be (padded)
     int clrX = max(0, (int)tlx - pad);
     int clrY = max(0, (int)tly - pad);
-    int clrW = min(480 - clrX, (int)bw + 2*pad);
-    int clrH = min(480 - clrY, (int)bh + 2*pad);
+    int clrW = min(DISPLAY_WIDTH - clrX, (int)bw + 2*pad);
+    int clrH = min(DISPLAY_HEIGHT - clrY, (int)bh + 2*pad);
     if (clrW > 0 && clrH > 0) gfx->fillRect(clrX, clrY, clrW, clrH, BLACK);
   }
   else
@@ -872,8 +729,8 @@ static void draw_center_text_smooth(const char *msg, uint16_t color = WHITE, con
     // Clear previous text area only (padded)
     int clrX = max(0, (int)g_prev_tlx - pad);
     int clrY = max(0, (int)g_prev_tly - pad);
-    int clrW = min(480 - clrX, (int)g_prev_bw + 2*pad);
-    int clrH = min(480 - clrY, (int)g_prev_bh + 2*pad);
+    int clrW = min(DISPLAY_WIDTH - clrX, (int)g_prev_bw + 2*pad);
+    int clrH = min(DISPLAY_HEIGHT - clrY, (int)g_prev_bh + 2*pad);
     if (clrW > 0 && clrH > 0) gfx->fillRect(clrX, clrY, clrW, clrH, BLACK);
   }
   gfx->setTextColor(color);
@@ -885,8 +742,9 @@ static void draw_center_text_smooth(const char *msg, uint16_t color = WHITE, con
 // --- Player UI --------------------------------------------------------------
 static inline uint16_t RGB(uint8_t r, uint8_t g, uint8_t b){ return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3); }
 
-static const int BTN_H = 90;
-static const int BTN_W = 160; // 480/3
+// Use constants defined at top of file
+// static const int BTN_H = 90;  -> BTN_HEIGHT
+// static const int BTN_W = 160; -> BTN_WIDTH
 // Volume icon box (clickable)
 // Icon base size (actual x/y computed dynamically for centering)
 static const int VOL_ICON_W = 40;
@@ -894,11 +752,11 @@ static const int VOL_ICON_H = 40;
 static const int VOL_ICON_Y = 12;
 // Last drawn hitbox for volume icon (for touch)
 static int g_vol_hit_x = 0, g_vol_hit_y = VOL_ICON_Y; static int g_vol_hit_w = VOL_ICON_W, g_vol_hit_h = VOL_ICON_H;
-// Progress bar geometry
-static const int PRG_X = 40;
-static const int PRG_W = 400;
-static const int PRG_H = 12;
-static const int PRG_Y = 480 - BTN_H - 30;
+// Progress bar geometry - use constants defined at top of file
+// static const int PRG_X = 40;  -> PROGRESS_X
+// static const int PRG_W = 400; -> PROGRESS_WIDTH
+// static const int PRG_H = 12;  -> PROGRESS_HEIGHT
+// static const int PRG_Y = 480 - BTN_H - 30; -> PROGRESS_Y
 
 static void draw_speaker_icon(int x, int y, bool muted)
 {
@@ -974,18 +832,18 @@ static int g_prev_prog_draw = -1;
 static void update_progress_display()
 {
   // overlay lane to avoid artifacts from album background
-  gfx->fillRect(0, PRG_Y - 10, 480, PRG_H + 20, RGB(10,10,10));
+  gfx->fillRect(0, PROGRESS_Y - 10, DISPLAY_WIDTH, PROGRESS_HEIGHT + 20, RGB(10,10,10));
   // background track
-  gfx->fillRect(PRG_X, PRG_Y, PRG_W, PRG_H, RGB(30,30,30));
-  int fw = (PRG_W * g_progress_pct) / 100;
-  gfx->fillRect(PRG_X, PRG_Y, fw, PRG_H, BLUE);
+  gfx->fillRect(PROGRESS_X, PROGRESS_Y, PROGRESS_WIDTH, PROGRESS_HEIGHT, RGB(30,30,30));
+  int fw = (PROGRESS_WIDTH * g_progress_pct) / 100;
+  gfx->fillRect(PROGRESS_X, PROGRESS_Y, fw, PROGRESS_HEIGHT, BLUE);
   // knob (thicker)
-  int kx = PRG_X + fw; if (kx < PRG_X) kx = PRG_X; if (kx > PRG_X + PRG_W - 1) kx = PRG_X + PRG_W - 1;
-  int ky = PRG_Y + PRG_H/2;
+  int kx = PROGRESS_X + fw; if (kx < PROGRESS_X) kx = PROGRESS_X; if (kx > PROGRESS_X + PROGRESS_WIDTH - 1) kx = PROGRESS_X + PROGRESS_WIDTH - 1;
+  int ky = PROGRESS_Y + PROGRESS_HEIGHT/2;
   int kr = 9;
   gfx->fillCircle(kx, ky, kr, WHITE);
   // optional border for definition
-  gfx->drawRoundRect(PRG_X-1, PRG_Y-1, PRG_W+2, PRG_H+2, 4, RGB(60,60,60));
+  gfx->drawRoundRect(PROGRESS_X-1, PROGRESS_Y-1, PROGRESS_WIDTH+2, PROGRESS_HEIGHT+2, 4, RGB(60,60,60));
 
   // time labels (left: elapsed or LIVE, right: total if known)
   auto fmt_label = [](const String &s)->String {
@@ -1011,11 +869,11 @@ static void update_progress_display()
   }
   gfx->setFont(&FreeSansBold12pt7b);
   gfx->setTextColor(WHITE, RGB(10,10,10));
-  int yText = PRG_Y - 16; // move labels higher to avoid overlap with the bar
-  if (l.length()) { gfx->setCursor(PRG_X, yText); gfx->print(l); }
+  int yText = PROGRESS_Y - 16; // move labels higher to avoid overlap with the bar
+  if (l.length()) { gfx->setCursor(PROGRESS_X, yText); gfx->print(l); }
   if (r.length()) {
     int16_t bx, by; uint16_t bw, bh; gfx->getTextBounds(r.c_str(), 0, 0, &bx, &by, &bw, &bh);
-    int rx = PRG_X + PRG_W - bw; if (rx < PRG_X) rx = PRG_X;
+    int rx = PROGRESS_X + PROGRESS_WIDTH - bw; if (rx < PROGRESS_X) rx = PROGRESS_X;
     gfx->setCursor(rx, yText); gfx->print(r);
   }
 }
@@ -1123,7 +981,7 @@ static void draw_text_outline(int16_t x, int16_t y, const String& s) {
 static void draw_title_overlay()
 {
   const int maxW = 440; // 20 px Rand links/rechts
-  const int y_center = 240;
+  const int y_center = DISPLAY_CENTER_Y;
   const int gap = 6; // Zeilenabstand
 
   // Title (kleiner Font)
@@ -1134,7 +992,7 @@ static void draw_title_overlay()
   int16_t tbx, tby; uint16_t tbw, tbh; gfx->getTextBounds("Ay", 0, 0, &tbx, &tby, &tbw, &tbh);
   int blockTop = y_center - (int)tbh*2 - 10;
   int blockBot = y_center + (int)tbh*2 + 10;
-  if (blockTop < 0) blockTop = 0; if (blockBot > 480) blockBot = 480;
+  if (blockTop < 0) blockTop = 0; if (blockBot > DISPLAY_HEIGHT) blockBot = DISPLAY_HEIGHT;
   // removed background band for transparent overlay
   // Redraw underlying background in overlay band to avoid ghosting when text changes
   {
@@ -1161,7 +1019,7 @@ static void draw_title_overlay()
     };
     auto draw_line_centered = [&](const String &line, int y){
       int16_t bx, by; uint16_t bw, bh; gfx->getTextBounds(line.c_str(), 0, 0, &bx, &by, &bw, &bh);
-      int x = (480 - (int)bw) / 2; draw_text_outline(x, y, line);
+      int x = (DISPLAY_WIDTH - (int)bw) / 2; draw_text_outline(x, y, line);
       return (int)bh;
     };
     String line1, line2; int idx = 0;
@@ -1212,18 +1070,18 @@ static void draw_player_static()
   if (g_player_screen) g_player_screen->drawTitleOverlay();
 
   // Bottom control bar
-  gfx->fillRect(0, 480-BTN_H, 480, BTN_H, RGB(0,0,0));
+  gfx->fillRect(0, DISPLAY_HEIGHT-BTN_HEIGHT, DISPLAY_WIDTH, BTN_HEIGHT, RGB(0,0,0));
   // separators
-  gfx->drawFastVLine(BTN_W, 480-BTN_H+8, BTN_H-16, RGB(40,40,40));
-  gfx->drawFastVLine(BTN_W*2, 480-BTN_H+8, BTN_H-16, RGB(40,40,40));
+  gfx->drawFastVLine(BTN_WIDTH, DISPLAY_HEIGHT-BTN_HEIGHT+8, BTN_HEIGHT-16, RGB(40,40,40));
+  gfx->drawFastVLine(BTN_WIDTH*2, DISPLAY_HEIGHT-BTN_HEIGHT+8, BTN_HEIGHT-16, RGB(40,40,40));
   // labels (optional)
   // draw transport icons (prev | play/pause | next)
-  int y0 = 480 - BTN_H;
-  int cy = y0 + BTN_H/2;
+  int y0 = DISPLAY_HEIGHT - BTN_HEIGHT;
+  int cy = y0 + BTN_HEIGHT/2;
   int s = 36; // match play size
   int margin = s/2 + 12; // bring closer to center button
-  int cx_prev = BTN_W - margin;       // near right separator of left segment
-  int cx_next = BTN_W*2 + margin;     // near left separator of right segment
+  int cx_prev = BTN_WIDTH - margin;       // near right separator of left segment
+  int cx_next = BTN_WIDTH*2 + margin;     // near left separator of right segment
   draw_icon_prev(cx_prev, cy, WHITE);
   draw_icon_next(cx_next, cy, WHITE);
 
@@ -1231,10 +1089,10 @@ static void draw_player_static()
 
 static void update_play_button()
 {
-  int y0 = 480-BTN_H;
+  int y0 = DISPLAY_HEIGHT-BTN_HEIGHT;
   // middle segment
-  gfx->fillRect(BTN_W, y0, BTN_W, BTN_H, RGB(0,0,0));
-  int cx = BTN_W + BTN_W/2; int cy = y0 + BTN_H/2;
+  gfx->fillRect(BTN_WIDTH, y0, BTN_WIDTH, BTN_HEIGHT, RGB(0,0,0));
+  int cx = BTN_WIDTH + BTN_WIDTH/2; int cy = y0 + BTN_HEIGHT/2;
   if (g_playing) draw_icon_pause(cx, cy, WHITE);
   else           draw_icon_play(cx, cy, WHITE);
 }
@@ -1330,12 +1188,10 @@ static void player_init()
   }
 
   if (!g_player_screen) g_player_screen = std::make_shared<ui::PlayerScreen>(&g_bg_mgr);
-  g_ui.setScreen(g_player_screen);
 
+  // Set up data suppliers BEFORE calling setScreen (which triggers enter() -> reset())
   if (g_player_screen) {
     g_player_screen->setOverlayDrawer([](){ if (g_player_screen) g_player_screen->drawTitleOverlay(); });
-  }
-  if (g_player_screen) {
     g_player_screen->setIsPlayingSupplier([](){ return g_playing; });
     g_player_screen->setVolumeSupplier([](){ return g_volume_pct; });
     g_player_screen->setMutedSupplier([](){ return g_muted; });
@@ -1347,15 +1203,17 @@ static void player_init()
     g_player_screen->setDurationSupplier([](){ return g_sonos_state.duration; });
   }
 
+  // Now set screen (this calls enter() -> reset())
+  g_ui.setScreen(g_player_screen);
 
-
+  // Force redraw after reset
   if (g_player_screen) g_player_screen->drawAllUi();
   // Hintergrund-Albumart: Manager initialisieren und starten
   g_bg_mgr.setUrl(g_bg_url);
   g_bg_mgr.start();
   g_player_ui_inited = true;
   // Optional: Legacy-Anbindung bleibt bis zur vollstndigen Migration
-  g_bg_mgr.attachLegacy(&g_bg_fb, &g_bg_ready, &g_bg_blit_row);
+  // g_bg_mgr.attachLegacy() entfernt - verwende nur noch das neue modulare System
 
   g_last_encoder = encoder_counter;
 }
@@ -1363,8 +1221,8 @@ static void player_init()
 
 static void handle_touch_player(int tx, int ty)
 {
-  // Volume icon toggle (mute/unmute)
-  if (tx >= g_vol_hit_x && tx < g_vol_hit_x + g_vol_hit_w && ty >= g_vol_hit_y && ty < g_vol_hit_y + g_vol_hit_h)
+  // Volume icon toggle (mute/unmute) - use PlayerScreen hit testing
+  if (g_player_screen && g_player_screen->isVolumeIconHit(tx, ty))
   {
     bool oldMuted = g_muted; int oldVol = g_volume_pct;
     int beforeVol = g_volume_pct;
@@ -1388,10 +1246,10 @@ static void handle_touch_player(int tx, int ty)
   }
 
   // Progress bar seek (with some vertical tolerance)
-  if (ty >= PRG_Y - 12 && ty <= PRG_Y + PRG_H + 12)
+  if (ty >= PROGRESS_Y - 12 && ty <= PROGRESS_Y + PROGRESS_HEIGHT + 12)
   {
-    int nx = tx; if (nx < PRG_X) nx = PRG_X; if (nx > PRG_X + PRG_W - 1) nx = PRG_X + PRG_W - 1;
-    int desiredPct = ((nx - PRG_X) * 100) / PRG_W;
+    int nx = tx; if (nx < PROGRESS_X) nx = PROGRESS_X; if (nx > PROGRESS_X + PROGRESS_WIDTH - 1) nx = PROGRESS_X + PROGRESS_WIDTH - 1;
+    int desiredPct = ((nx - PROGRESS_X) * 100) / PROGRESS_WIDTH;
     // Compute target time from current duration and send AVTransport.Seek
     auto parse_hms = [](const String &s)->int {
       int a = s.indexOf(':'); if (a < 0) return -1;
@@ -1424,9 +1282,10 @@ static void handle_touch_player(int tx, int ty)
 
 
   // Bottom transport buttons
-  if (ty >= 480 - BTN_H)
+  if (ty >= DISPLAY_HEIGHT - BTN_HEIGHT)
   {
-    int seg = tx / BTN_W;
+    int seg = tx / BTN_WIDTH;
+
     if (seg == 0)
     {
       bool ok = false;
@@ -1470,7 +1329,7 @@ static void player_loop()
 
   // Periodic memory diagnostics (every 5s)
   static unsigned long s_last_mem_log = 0;
-  if (millis() - s_last_mem_log > 5000) {
+  if (millis() - s_last_mem_log > MEMORY_LOG_INTERVAL) {
     s_last_mem_log = millis();
     size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     size_t freeps = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -1482,7 +1341,7 @@ static void player_loop()
 
 
   // Sonos poll: adopt state from selected room
-  if (g_sonos.isReady() && millis() - g_last_sonos_poll > 1000)
+  if (g_sonos.isReady() && millis() - g_last_sonos_poll > SONOS_POLL_INTERVAL)
   {
     g_last_sonos_poll = millis();
     SonosState st = g_sonos_state;
@@ -1648,6 +1507,7 @@ static void player_loop()
   {
     handle_touch_player(tx, ty);
   }
+
   // Button: short tap -> open config menu
   if (g_btn_short_released) {
     g_btn_short_released = false;
@@ -1905,9 +1765,9 @@ static void draw_config_menu_list()
     String labelStr;
     if (i == 0) labelStr = String(L_BRIGHTNESS);
     else if (i == 1) labelStr = String(L_SONOS_ROOM);
-    else if (i == 2) labelStr = String(L_ALBUM_ART);
-    else if (i == 3) labelStr = String(L_ABOUT);
-    else if (i == 4) labelStr = String(L_ALBUM_ART_LOG) + String(": ") + (g_albumart_log_verbose ? String("An") : String("Aus"));
+    else if (i == 2) labelStr = String(L_TITLE_INFO);
+    else if (i == 3) labelStr = String(L_SYSTEM_INFO);
+    else if (i == 4) labelStr = String(L_ABOUT);
     else if (i == 5) labelStr = String("Reset");
     else if (i == 6) labelStr = String("Zurueck zum Player");
     String label = ascii_fallback(labelStr);
@@ -1940,6 +1800,9 @@ static void config_loop()
     g_last_encoder = encoder_counter;
     draw_config_static();
   }
+
+  // Touch feedback disabled due to system freeze issues
+
   // Encoder navigation (less sensitive: 2 ticks per step)
   static int cfg_enc_accum = 0;
   int cur = encoder_counter;
@@ -1957,10 +1820,30 @@ static void config_loop()
       draw_config_menu_list();
     }
   }
+  // Touch: tap on menu item -> select immediately
+  int tx, ty;
+  if (g_touch.readTap(tx, ty)) {
+    const int N = 7;
+    const int y0_base = 120; const int dy = 48;
+    for (int i = 0; i < N; ++i) {
+      int y0 = y0_base + i * dy;
+      // Check if touch is within menu item area (±22 pixels from center)
+      if (ty >= y0 - 22 && ty <= y0 + 22) {
+        g_menu_sel = i;
+        draw_config_menu_list(); // Update visual selection
+        Serial.printf("Config: touch select item %d\n", g_menu_sel);
+        // Execute immediately (same logic as button press)
+        goto execute_menu_selection;
+      }
+    }
+  }
+
   // Button: short tap -> select menu item
   if (g_btn_short_released) {
     g_btn_short_released = false;
     Serial.printf("Config: select item %d\n", g_menu_sel);
+
+    execute_menu_selection:
     if (g_menu_sel == 0) {
       g_screen = SCREEN_CONFIG_BRIGHTNESS;
       g_brightness_ui_inited = false;
@@ -1968,16 +1851,14 @@ static void config_loop()
       g_screen = SCREEN_CONFIG_ROOM;
       g_room_ui_inited = false;
     } else if (g_menu_sel == 2) {
-      g_screen = SCREEN_CONFIG_ALBUM;
-      g_album_ui_inited = false;
+      g_screen = SCREEN_CONFIG_TITLE_INFO;
+      g_title_info_ui_inited = false;
     } else if (g_menu_sel == 3) {
+      g_screen = SCREEN_CONFIG_SYSTEM_INFO;
+      g_system_info_ui_inited = false;
+    } else if (g_menu_sel == 4) {
       g_screen = SCREEN_CONFIG_ABOUT;
       g_about_ui_inited = false;
-    } else if (g_menu_sel == 4) {
-      // Toggle Album-Art verbose logging
-      g_albumart_log_verbose = !g_albumart_log_verbose;
-      Serial.printf("AlbumArt: verbose logging %s\n", g_albumart_log_verbose ? "ON" : "OFF");
-      draw_config_menu_list();
     } else if (g_menu_sel == 5) {
       // Reset device (reboot)
       Serial.println("Config: Reset -> ESP.restart()");
@@ -1985,13 +1866,22 @@ static void config_loop()
       ESP.restart();
     } else if (g_menu_sel == 6) {
       // Back to player
+      Serial.printf("Config: returning to player, g_player_screen=%p\n", g_player_screen.get());
       g_screen = SCREEN_PLAYER;
+      if (g_player_screen) {
+        Serial.println("Config: calling g_ui.refreshScreen() to force enter()");
+        g_ui.refreshScreen();  // Force enter() -> reset() even if same screen
+        Serial.println("Config: g_ui.refreshScreen() completed");
+      } else {
+        Serial.println("Config: ERROR - g_player_screen is NULL!");
+      }
       g_player_ui_inited = false;
       g_config_ui_inited = false;
       return;
     } else {
       // Fallback: return to player
       g_screen = SCREEN_PLAYER;
+      g_ui.setScreen(g_player_screen);  // Trigger enter() -> reset()
       g_player_ui_inited = false;
     }
     return;
@@ -2077,11 +1967,14 @@ static void brightness_loop()
       }
     }
   }
+
+  // Touch feedback disabled due to system freeze issues
   // Button: back to Config (short tap)
   if (g_btn_short_released) {
     g_btn_short_released = false;
     // After setting brightness, return to Player
     g_screen = SCREEN_PLAYER;
+    g_ui.setScreen(g_player_screen);  // Trigger enter() -> reset()
     g_player_ui_inited = false;
     g_config_ui_inited = false;
     return;
@@ -2103,7 +1996,7 @@ static unsigned long g_room_last_ui_scan = 0; // periodic scan while in room UI
 
 static void scan_sonos_rooms(uint32_t timeout_ms = 2000, bool merge = false, bool light = false)
 {
-  if (g_discovery_paused) { LOGD("Rooms: scan paused\n"); return; }
+  if (g_discovery_paused) { LOGD("Sonos", "Rooms: scan paused"); return; }
 
   // Centralized discovery: short SSDP burst via DiscoveryManager
   DiscoveryManager& dm = DiscoveryManager::instance();
@@ -2152,7 +2045,7 @@ static void scan_sonos_rooms(uint32_t timeout_ms = 2000, bool merge = false, boo
     }
   }
 
-  LOGD("Rooms: total %d\n", g_room_count);
+  LOGD("Sonos", "Rooms: total %d", g_room_count);
 }
 
 static void draw_room_list()
@@ -2267,6 +2160,7 @@ static void room_loop()
       LOGI("Rooms: connected to \"%s\" -> %s\n", g_sonos.roomName().c_str(), g_sonos.baseURL().c_str());
       // Switch to Player immediately; schedule poll for player loop (no blocking here)
       g_screen = SCREEN_PLAYER;
+      g_ui.setScreen(g_player_screen);  // Trigger enter() -> reset()
       g_player_ui_inited = false;
       g_config_ui_inited = false;
       g_room_ui_inited = false;
@@ -2370,6 +2264,256 @@ static void draw_about_content()
     }
   }
 }
+
+// --- Title Info Screen ---------------------------------------------------
+static void draw_title_info_static()
+{
+  gfx->fillScreen(RGB(10,10,10));
+  gfx->setFont(&FreeSansBold18pt7b);
+  gfx->setTextColor(WHITE, RGB(10,10,10));
+  gfx->setCursor(120, 60);
+  gfx->print(ascii_fallback(String(L_TITLE_INFO)));
+}
+
+static void draw_title_info_content()
+{
+  // Clear content area
+  gfx->fillRect(20, 80, 440, 380, RGB(10,10,10));
+
+  gfx->setFont(&FreeSansBold12pt7b);
+  gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+
+  int y = 120;
+  const int dy = 35;
+
+  // Title
+  gfx->setCursor(30, y);
+  gfx->print("Titel: ");
+  gfx->setTextColor(WHITE, RGB(10,10,10));
+  gfx->print(ascii_fallback(g_sonos_state.title.length() > 0 ? g_sonos_state.title : String("Unbekannt")));
+  y += dy;
+
+  // Artist
+  gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+  gfx->setCursor(30, y);
+  gfx->print("Kuenstler: ");
+  gfx->setTextColor(WHITE, RGB(10,10,10));
+  gfx->print(ascii_fallback(g_sonos_state.artist.length() > 0 ? g_sonos_state.artist : String("Unbekannt")));
+  y += dy;
+
+  // Album
+  gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+  gfx->setCursor(30, y);
+  gfx->print("Album: ");
+  gfx->setTextColor(WHITE, RGB(10,10,10));
+  gfx->print(ascii_fallback(g_sonos_state.album.length() > 0 ? g_sonos_state.album : String("Unbekannt")));
+  y += dy;
+
+  // Duration
+  gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+  gfx->setCursor(30, y);
+  gfx->print("Dauer: ");
+  gfx->setTextColor(WHITE, RGB(10,10,10));
+  gfx->print(g_sonos_state.duration.length() > 0 ? g_sonos_state.duration : String("--:--"));
+  y += dy;
+
+  // Current time
+  gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+  gfx->setCursor(30, y);
+  gfx->print("Position: ");
+  gfx->setTextColor(WHITE, RGB(10,10,10));
+  gfx->print(g_sonos_state.relTime.length() > 0 ? g_sonos_state.relTime : String("--:--"));
+  y += dy;
+
+  // Transport state
+  gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+  gfx->setCursor(30, y);
+  gfx->print("Status: ");
+  gfx->setTextColor(WHITE, RGB(10,10,10));
+  String status = g_sonos_state.transportState;
+  if (status == "PLAYING") status = "Spielt";
+  else if (status == "PAUSED_PLAYBACK") status = "Pausiert";
+  else if (status == "STOPPED") status = "Gestoppt";
+  else if (status.length() == 0) status = "Unbekannt";
+  gfx->print(ascii_fallback(status));
+  y += dy;
+
+  // Room
+  gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+  gfx->setCursor(30, y);
+  gfx->print("Raum: ");
+  gfx->setTextColor(WHITE, RGB(10,10,10));
+  gfx->print(ascii_fallback(g_sonos.roomName().length() > 0 ? g_sonos.roomName() : String("Unbekannt")));
+  y += dy;
+
+  // Volume
+  gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+  gfx->setCursor(30, y);
+  gfx->print("Lautstaerke: ");
+  gfx->setTextColor(WHITE, RGB(10,10,10));
+  gfx->print(String(g_muted ? 0 : g_volume_pct) + "%");
+  if (g_muted) {
+    gfx->setTextColor(RGB(255,100,100), RGB(10,10,10));
+    gfx->print(" (Stumm)");
+  }
+
+  // Back hint
+  gfx->setFont(&FreeSansBold12pt7b);
+  gfx->setTextColor(RGB(150,150,150), RGB(10,10,10));
+  gfx->setCursor(30, 450);
+  gfx->print("Taste: zurueck zum Menue");
+}
+
+static void title_info_loop()
+{
+  if (!g_title_info_ui_inited) {
+    g_title_info_ui_inited = true;
+    draw_title_info_static();
+    draw_title_info_content();
+  }
+
+  // Refresh content every 2 seconds
+  static unsigned long last_refresh = 0;
+  if (millis() - last_refresh >= 2000) {
+    last_refresh = millis();
+    draw_title_info_content();
+  }
+
+  // Button: back to Config (short tap)
+  if (g_btn_short_released) {
+    g_btn_short_released = false;
+    g_screen = SCREEN_CONFIG;
+    g_config_ui_inited = false;
+    return;
+  }
+}
+
+// --- System Info Screen ---------------------------------------------------
+static void draw_system_info_static()
+{
+  gfx->fillScreen(RGB(10,10,10));
+  gfx->setFont(&FreeSansBold18pt7b);
+  gfx->setTextColor(WHITE, RGB(10,10,10));
+  gfx->setCursor(120, 60);
+  gfx->print(ascii_fallback(String(L_SYSTEM_INFO)));
+}
+
+static void draw_system_info_content()
+{
+  // Clear content area
+  gfx->fillRect(20, 80, 440, 380, RGB(10,10,10));
+
+  gfx->setFont(&FreeSansBold12pt7b);
+  gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+
+  int y = 120;
+  const int dy = 35;
+
+  // WiFi Status
+  gfx->setCursor(30, y);
+  gfx->print("WiFi: ");
+  gfx->setTextColor(g_wifi_ok ? RGB(100,255,100) : RGB(255,100,100), RGB(10,10,10));
+  gfx->print(g_wifi_ok ? "Verbunden" : "Getrennt");
+  y += dy;
+
+  // WiFi SSID
+  if (g_wifi_ok) {
+    gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+    gfx->setCursor(30, y);
+    gfx->print("SSID: ");
+    gfx->setTextColor(WHITE, RGB(10,10,10));
+    gfx->print(WiFi.SSID());
+    y += dy;
+
+    // IP Address
+    gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+    gfx->setCursor(30, y);
+    gfx->print("IP: ");
+    gfx->setTextColor(WHITE, RGB(10,10,10));
+    gfx->print(WiFi.localIP().toString());
+    y += dy;
+  }
+
+  // Heap Memory
+  size_t heap_free = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  size_t heap_total = heap_caps_get_total_size(MALLOC_CAP_8BIT);
+  gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+  gfx->setCursor(30, y);
+  gfx->print("Heap: ");
+  gfx->setTextColor(WHITE, RGB(10,10,10));
+  gfx->print(String(heap_free / 1024) + " KB frei");
+  y += dy;
+
+  // PSRAM Memory
+  size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+  gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+  gfx->setCursor(30, y);
+  gfx->print("PSRAM: ");
+  gfx->setTextColor(WHITE, RGB(10,10,10));
+  gfx->print(String(psram_free / 1024) + " KB frei");
+  y += dy;
+
+  // Uptime
+  unsigned long uptime_ms = millis();
+  unsigned long uptime_sec = uptime_ms / 1000;
+  unsigned long hours = uptime_sec / 3600;
+  unsigned long minutes = (uptime_sec % 3600) / 60;
+  unsigned long seconds = uptime_sec % 60;
+  gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+  gfx->setCursor(30, y);
+  gfx->print("Laufzeit: ");
+  gfx->setTextColor(WHITE, RGB(10,10,10));
+  gfx->print(String(hours) + "h " + String(minutes) + "m " + String(seconds) + "s");
+  y += dy;
+
+  // Brightness
+  gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+  gfx->setCursor(30, y);
+  gfx->print("Helligkeit: ");
+  gfx->setTextColor(WHITE, RGB(10,10,10));
+  gfx->print(String(g_brightness_pct) + "%");
+  y += dy;
+
+  // Sonos Connection
+  gfx->setTextColor(RGB(200,200,200), RGB(10,10,10));
+  gfx->setCursor(30, y);
+  gfx->print("Sonos: ");
+  gfx->setTextColor(g_sonos.isReady() ? RGB(100,255,100) : RGB(255,100,100), RGB(10,10,10));
+  gfx->print(g_sonos.isReady() ? "Verbunden" : "Getrennt");
+  y += dy;
+
+  // Back hint
+  gfx->setFont(&FreeSansBold12pt7b);
+  gfx->setTextColor(RGB(150,150,150), RGB(10,10,10));
+  gfx->setCursor(30, 450);
+  gfx->print("Taste: zurueck zum Menue");
+}
+
+static void system_info_loop()
+{
+  if (!g_system_info_ui_inited) {
+    g_system_info_ui_inited = true;
+    draw_system_info_static();
+    draw_system_info_content();
+  }
+
+  // Refresh content every second
+  static unsigned long last_refresh = 0;
+  if (millis() - last_refresh >= 1000) {
+    last_refresh = millis();
+    draw_system_info_content();
+  }
+
+  // Button: back to Config (short tap)
+  if (g_btn_short_released) {
+    g_btn_short_released = false;
+    g_screen = SCREEN_CONFIG;
+    g_config_ui_inited = false;
+    return;
+  }
+}
+
 static void about_loop()
 {
   if (!g_about_ui_inited) {
@@ -2864,19 +3008,18 @@ void loop()
     // Fire long-press once while still holding
     if (b == 1 && !g_btn_long_handled && (millis() - g_btn_down_since) >= BTN_LONG_MS) {
       g_btn_long_handled = true;
-      // Ignore long-press on AlbumArt screen (show until short press)
-      if (g_screen != SCREEN_PLAYER && g_screen != SCREEN_CONFIG_ALBUM) {
+      // Long-press: back to Player (except on Player screen)
+      if (g_screen != SCREEN_PLAYER) {
         Serial.println("Button: LONG -> back to Player");
         g_screen = SCREEN_PLAYER;
-
+        g_ui.setScreen(g_player_screen);  // Trigger enter() -> reset()
         g_player_ui_inited = false;
         g_config_ui_inited = false;
         g_brightness_ui_inited = false;
         g_about_ui_inited = false;
         g_room_ui_inited = false;
-        g_album_ui_inited = false;
-      } else if (g_screen == SCREEN_CONFIG_ALBUM) {
-        Serial.println("Button: LONG ignored on AlbumArt");
+        g_title_info_ui_inited = false;
+        g_system_info_ui_inited = false;
       }
     }
   }
@@ -2903,10 +3046,12 @@ void loop()
       brightness_loop();
     } else if (g_screen == SCREEN_CONFIG_ROOM) {
       room_loop();
+    } else if (g_screen == SCREEN_CONFIG_TITLE_INFO) {
+      title_info_loop();
+    } else if (g_screen == SCREEN_CONFIG_SYSTEM_INFO) {
+      system_info_loop();
     } else if (g_screen == SCREEN_CONFIG_ABOUT) {
       about_loop();
-    } else if (g_screen == SCREEN_CONFIG_ALBUM) {
-      albumart_loop();
     }
     delay(20);
     return;

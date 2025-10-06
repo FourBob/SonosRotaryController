@@ -3,7 +3,7 @@
 #include <WiFiUdp.h>
 #include <HTTPClient.h>
 #include <vector>
-#include "logging.h"
+#include "base/Log.h"
 
 struct RoomInfo {
   String name;     // display name

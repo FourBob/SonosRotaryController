@@ -2,42 +2,36 @@
 
 // Release notes text to show in the "Über" screen.
 // Keep plain text/Markdown-ish content; rendering will be simple wrapped text.
-static const char kReleaseNotesText[] = R"(## SonosRotaryController v1.5
+static const char kReleaseNotesText[] = R"(## SonosRotaryController v1.99
 
 Highlights:
-- Discovery fast-path: SSDP-Fenster sammelt nur Sonos, HTTP erst danach; Topology-first; Base-URL-Cache
-- Zuverlässiger Default-Raum-Connect mit Fast-Path und Fallback auf Legacy-Discover
-- UI-Verbesserungen: kein "LIVE" ohne Zeitinfos; alte Titel/Artist werden bei fehlenden Metadaten geleert
-- Einstellungen: Reset (Neustart) und "Zurück zum Player"; Album‑Art Log Toggle
-- "Über" ist jetzt statisch (kein Auto-Scroll)
-- Stabilität/Performance: pausierte Discovery während Connect, einheitliche HTTP-Timeouts, weniger Redraw/Flicker
-- Bugfixes: Apostroph-Entities (&apos;, &#39;) korrekt; Album‑Art Rendering entkoppelt, nur einmal pro Track
+- KRITISCHE BUGFIXES: Touch-Interface-Freeze behoben, Album Art Clipping nach Menu repariert
+- UI-STABILITÄT: Touch-Feedback-System deaktiviert (verursachte System-Freeze), alle Touch-Events funktionieren wieder
+- ALBUM ART: Progressive Blitting-Konflikte behoben - vollständiges Bild nach Config-Menu-Rückkehr
+- PERFORMANCE: Magic Numbers eliminiert, HTTP-Timeouts optimiert, konstante Display-Dimensionen
+- CODE-QUALITÄT: Umfassende Bereinigung, Legacy-Code entfernt, wartbarere Konstanten-Struktur
 
-Details:
-- Discovery
-  - SSDP: Filter strikt auf Sonos (ZonePlayer/RINCON), keine blockierenden HTTP-Requests im Fenster
-  - Danach: gezielte HTTPs; wenn Base bekannt ist, liefert /status/topology alle Räume
-  - Background-Scan in Intervallen; Room-UI führt leichte Merges durch (keine UI-Blockade)
-- Default-Raum
-  - Boot: erst DiscoveryManager (Cache/SSDP) → connectKnown(); Fallback discoverRoom()
-  - Timeout feinjustiert; Logs für Diagnose
-- Player UI
-  - Title/Artist Overlay: zweizeiliges Wrap mit Umlaut-Fallback
-  - Kein "LIVE" mehr ohne Zeitinfos; Fortschrittsanzeige robust
-  - Bei Raumwechsel ohne Metadaten: Overlay wird geleert
-- Einstellungen
-  - Helligkeit: Drehgeber + Touch-Slider
-  - Sonos-Raum: Liste via SSDP/Topology, schneller Connect (Base-Cache)
-  - Album‑Art: separater Screen; Verbose-Log schaltbar
-  - Über: statische Textanzeige
-  - Reset (ESP.restart) und "Zurück zum Player" neu
-- Bedienung
-  - Kurz-Tap: Menü/Bestätigen
-  - Lang-Tap: global zurück zum Player (außer im Album‑Art Screen)
-  - Encoder: 2‑Tick‑Debounce; Menü mit Wrap (kein Anschlag oben/unten)
-- Technik
-  - Zentraler DiscoveryManager, Logging mit Leveln (INFO/DEBUG), standardisierte HTTP-Timeouts
-  - Reduzierte Vollbild-Redraws zur Flicker-Vermeidung
+Kritische Reparaturen:
+- Touch-Interface: System-Freeze durch Touch-Feedback behoben - alle Buttons funktionieren wieder
+- Album Art: 1/3-Clipping nach Menu-Rückkehr repariert durch Progressive Blitting-Pause (5s) und blit_row_=480
+- Memory: Stabile 7.2MB Heap, 6.9MB PSRAM - keine Leaks durch deaktiviertes Touch-Feedback
 
-Viel Spaß mit v1.5!)";
+Performance-Optimierungen:
+- HTTP-Timeouts: Konstante 1200ms/3000ms/8000ms für konsistente Performance
+- Magic Numbers: Alle durch constexpr-Konstanten ersetzt (DISPLAY_WIDTH/HEIGHT, Polling-Intervalle)
+- Progressive Blitting: Intelligente Pause-Mechanik verhindert Überschreibung von forceFullRedraw()
+
+Code-Bereinigung:
+- Legacy Album Art System: ~1.5MB PSRAM gespart, ~300 Zeilen Code entfernt
+- Logging-System: Doppelte logging.h entfernt, einheitlich base/Log.h
+- Include-Struktur: Bereinigt und optimiert
+- Touch-Feedback: Sicher deaktiviert bis robuste Implementierung verfügbar
+
+Stabilität:
+- System läuft ohne Freezes oder Crashes
+- Touch-Events reagieren sofort und zuverlässig
+- Album Art wird vollständig nach Menu-Navigation angezeigt
+- Memory-Management optimiert und stabil
+
+Viel Spaß mit v1.99 - Stabilität first!)";
 

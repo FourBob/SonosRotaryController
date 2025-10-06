@@ -154,6 +154,27 @@ void BackgroundArt::tick() {
 }
 
 void BackgroundArt::blitStep(ui_gfx::Display& disp) {
+  // Check if blitting is paused (after forceFullRedraw)
+  if (millis() < blit_pause_until_) {
+    return; // Silent pause - no debug spam
+  }
+
+  // Skip progressive blitting if we just did a full redraw (legacy check)
+  if (fully_redrawn_) {
+    Serial.println("AlbumArt(bg): blitStep() skipped due to full redraw (legacy)");
+    // Reset the flag after pause period to allow progressive blitting again
+    fully_redrawn_ = false;
+    blit_row_ = 0; // Reset to start progressive blitting from top
+    Serial.println("AlbumArt(bg): fully_redrawn flag reset, progressive blitting will resume");
+  }
+
+  // Check if progressive blitting is already complete (after forceFullRedraw)
+  if (blit_row_ >= 480) {
+    return; // Silent - progressive blitting is complete, don't restart
+  }
+
+  Serial.println("AlbumArt(bg): blitStep() executing progressive draw");
+
   // Prefer internal buffer
   if (fb_ && ready_) {
     const int TOP_RESERVE = 80;
@@ -170,20 +191,7 @@ void BackgroundArt::blitStep(ui_gfx::Display& disp) {
     blit_row_ = y_start + h;
     return;
   }
-  // Fallback to legacy attachment during migration
-  if (legacy_fb_ptr_ && *legacy_fb_ptr_ && legacy_ready_ptr_ && *legacy_ready_ptr_) {
-    const int TOP_RESERVE = 80;
-    const int BOTTOM_RESERVE = 90 + 40;
-    const int STRIP = 24;
-    int y_start = *legacy_blit_row_ptr_;
-    if (y_start < TOP_RESERVE) y_start = TOP_RESERVE;
-    int y_limit = 480 - BOTTOM_RESERVE;
-    if (y_start >= y_limit) { *legacy_blit_row_ptr_ = 480; return; }
-    int h = (y_start + STRIP <= y_limit) ? STRIP : (y_limit - y_start);
-    if (h <= 0) { *legacy_blit_row_ptr_ = 480; return; }
-    disp.raw()->draw16bitRGBBitmap(0, y_start, &(*legacy_fb_ptr_)[(size_t)y_start * 480], 480, h);
-    *legacy_blit_row_ptr_ = y_start + h;
-  }
+  // Legacy-Fallback entfernt - verwende nur noch das interne System
 }
 
 bool BackgroundArt::consumeDidBlit() {
@@ -199,6 +207,35 @@ void BackgroundArt::blitRegion(ui_gfx::Display& disp, int y0, int y1) {
   if (y0 > y1) return;
   int h = y1 - y0 + 1;
   disp.raw()->draw16bitRGBBitmap(0, y0, &fb_[(size_t)y0 * 480], 480, h);
+}
+
+void BackgroundArt::forceFullRedraw(ui_gfx::Display& disp) {
+  // Force complete redraw of background image (for screen switching)
+  Serial.printf("AlbumArt(bg): forceFullRedraw() called, fb_=%p ready_=%d\n", fb_, ready_);
+  if (fb_ && ready_) {
+    Serial.println("AlbumArt(bg): using internal buffer for full redraw");
+    // Draw the complete background image immediately
+    disp.raw()->draw16bitRGBBitmap(0, 0, fb_, 480, 480);
+    // Pause progressive blitting for 5 seconds to let the full image be visible
+    pauseBlitting(5000);
+    // Reset progressive blitting to end state to prevent overwriting
+    blit_row_ = 480; // Set to end so progressive blitting won't restart
+    fully_redrawn_ = false; // Clear legacy flag
+    did_blit_ = true;
+    Serial.println("AlbumArt(bg): forced full redraw completed, progressive blitting paused for 5s and reset to end");
+  // Legacy-Fallback entfernt
+  } else {
+    Serial.println("AlbumArt(bg): ERROR - no valid buffer available for full redraw");
+  }
+}
+
+void BackgroundArt::pauseBlitting(unsigned long duration_ms) {
+  blit_pause_until_ = millis() + duration_ms;
+  Serial.printf("AlbumArt(bg): progressive blitting paused for %lu ms\n", duration_ms);
+}
+
+bool BackgroundArt::wasFullyRedrawn() const {
+  return fully_redrawn_;
 }
 
 } // namespace albumart

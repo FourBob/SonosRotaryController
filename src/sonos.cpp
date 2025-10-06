@@ -1,9 +1,14 @@
 #include "sonos.h"
 
-static String httpGetText(const String &url) {
+// HTTP timeout constants for consistent performance
+static constexpr int HTTP_TIMEOUT_QUICK = 1200;   // Quick operations like device discovery
+static constexpr int HTTP_TIMEOUT_NORMAL = 3000;  // Normal SOAP operations
+static constexpr int HTTP_TIMEOUT_SLOW = 8000;    // Slow operations like downloads
+
+static String httpGetText(const String &url, int timeout_ms = HTTP_TIMEOUT_QUICK) {
   HTTPClient http;
   if (!http.begin(url)) return String();
-  http.setTimeout(1200);
+  http.setTimeout(timeout_ms);
   http.addHeader("Connection", "close");
   int code = http.GET();
   String out;
@@ -188,7 +193,7 @@ bool SonosClient::_soapPOST(const String &controlPath, const String &soapAction,
   String url = _baseURL + controlPath; // e.g. /MediaRenderer/RenderingControl/Control
   HTTPClient http;
   if (!http.begin(url)) { Serial.println("Sonos DBG: http.begin failed"); _lastHTTP = -1; return false; }
-  http.setTimeout(1200);
+  http.setTimeout(HTTP_TIMEOUT_NORMAL); // Use consistent timeout for SOAP operations
   http.addHeader("Content-Type", "text/xml; charset=\"utf-8\"");
   http.addHeader("SOAPACTION", soapAction);
   http.addHeader("Connection", "close");

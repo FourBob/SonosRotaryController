@@ -37,7 +37,7 @@ static String baseFromLocation(const String& url) {
 }
 
 void DiscoveryManager::mergeBurst(uint32_t window_ms) {
-  if (_paused) { LOGD("Rooms: mergeBurst skipped (paused)\n"); return; }
+  if (_paused) { LOGD("Discovery", "Rooms: mergeBurst skipped (paused)"); return; }
 
   WiFiUDP udp; udp.begin(0);
   const char *msearch1 =
@@ -114,6 +114,6 @@ void DiscoveryManager::upsert(const String& name, const String& base) {
   }
   RoomInfo info; info.name = name; info.base = base; info.seenMs = now;
   _rooms.push_back(info);
-  LOGD("SSDP: room=\"%s\" base=%s\n", name.c_str(), base.c_str());
+  LOGD("Discovery", "SSDP: room=\"%s\" base=%s", name.c_str(), base.c_str());
 }
 

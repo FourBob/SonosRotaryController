@@ -9,6 +9,7 @@
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 
+
 class Arduino_RGB_Display; extern Arduino_RGB_Display* gfx;
 
 namespace ui {
@@ -22,6 +23,12 @@ public:
   void drawTitleOverlay() { drawTitle_(); }
   void drawPlay()         { drawPlay_(); }
   void drawVolume()       { drawVolume_(); }
+
+  // Touch hit testing
+  bool isVolumeIconHit(int tx, int ty) const {
+    return (tx >= volHitX_ && tx < volHitX_ + volHitW_ &&
+            ty >= volHitY_ && ty < volHitY_ + volHitH_);
+  }
   void drawProgress()     { drawProgress_(); }
   void drawAllUi()        { drawPlay(); drawVolume(); drawProgress(); }
 
@@ -39,8 +46,42 @@ public:
   // Backward-compatible: allow external callback override for title if needed
   void setOverlayDrawer(std::function<void()> fn)   { overlayDrawCb_ = std::move(fn); }
 
-  void enter() override {}
+  void enter() override { reset(); }
   void exit() override {}
+
+  // Force redraw of all UI elements (call when returning from other screens)
+  void reset() {
+    Serial.println("PlayerScreen: reset() called");
+    prevVol_ = -1;
+    prevMuted_ = false;
+    prevRoom_ = "";
+    // Reset touch hit areas
+    volHitX_ = 0; volHitY_ = 0; volHitW_ = 0; volHitH_ = 0;
+
+    // Clear the entire screen first (config menu may have left artifacts)
+    if (gfx) {
+      Serial.println("PlayerScreen: clearing screen before forceFullRedraw");
+      gfx->fillScreen(RGB(0,0,0));  // Clear to black
+    }
+
+    // Force background to redraw completely on next draw() call
+    if (bg_) {
+      Serial.println("PlayerScreen: bg_ is available");
+      if (gfx) {
+        Serial.println("PlayerScreen: gfx is available, calling forceFullRedraw");
+        ui_gfx::Display disp(gfx);
+        bg_->forceFullRedraw(disp);
+        Serial.println("PlayerScreen: forceFullRedraw completed");
+      } else {
+        Serial.println("PlayerScreen: gfx is NULL, cannot call forceFullRedraw");
+      }
+    } else {
+      Serial.println("PlayerScreen: bg_ is NULL");
+    }
+
+    // Note: Don't call drawAllUi() here as data suppliers might not be set yet
+    // drawAllUi() will be called later in player_init()
+  }
   void tick() override { /* later: handle encoder/touch & Sonos updates */ }
 
   void draw(ui_gfx::Display& d) override {
@@ -90,16 +131,56 @@ private:
   static void drawIconPause_(int cx, int cy, uint16_t col){ int h=40,w=12,g=10; gfx->fillRect(cx-g/2-w, cy-h/2, w,h,col); gfx->fillRect(cx+g/2, cy-h/2, w,h,col);}
   static void drawIconPrev_(int cx, int cy, uint16_t col){ int s=36,g=6,cxL=cx-(s/2+g/2),cxR=cx+(s/2+g/2); gfx->fillTriangle(cxL+s/2,cy-s/2,cxL+s/2,cy+s/2,cxL-s/2,cy,col); gfx->fillTriangle(cxR+s/2,cy-s/2,cxR+s/2,cy+s/2,cxR-s/2,cy,col);}
   static void drawIconNext_(int cx, int cy, uint16_t col){ int s=36,g=6,cxL=cx-(s/2+g/2),cxR=cx+(s/2+g/2); gfx->fillTriangle(cxL-s/2,cy-s/2,cxL-s/2,cy+s/2,cxL+s/2,cy,col); gfx->fillTriangle(cxR-s/2,cy-s/2,cxR-s/2,cy+s/2,cxR+s/2,cy,col);}
-  static void drawSpeaker_(int x, int y, bool muted){ int boxW=VOL_ICON_W, boxH=VOL_ICON_H; int bx=x+(boxW-16)/2, by=y+6; uint16_t FG=WHITE; gfx->fillRect(bx,by+4, max(6,16/4),16-8,FG); int nw=max(3,(16/4)/2); int nx=bx-1; gfx->fillRect(nx,by+8, nw, max(4,(16/2)-2), FG); int cx=bx+16+2, cy=y+boxH/2; int r=6; gfx->drawCircle(cx,cy,r,FG); if (!muted){ gfx->drawCircle(cx+6,cy,r+4,FG);} }
+  static void drawSpeaker_(int x, int y, bool muted) {
+    // For now, use improved primitive drawing (PNG integration can be added later)
+    uint16_t FG = WHITE;
+
+    // Draw speaker body (rectangle)
+    int bodyW = 12, bodyH = 16;
+    int bodyX = x + 8, bodyY = y + 12;
+    gfx->fillRect(bodyX, bodyY, bodyW, bodyH, FG);
+
+    // Draw speaker cone (triangle)
+    int coneX = bodyX + bodyW;
+    int coneY1 = bodyY + 2, coneY2 = bodyY + bodyH - 2;
+    int coneW = 8;
+    gfx->fillTriangle(coneX, coneY1, coneX, coneY2, coneX + coneW, bodyY + bodyH/2, FG);
+
+    // Draw sound waves (if not muted)
+    if (!muted) {
+      int waveX = coneX + coneW + 2;
+      int centerY = y + VOL_ICON_H/2;
+      gfx->drawCircle(waveX, centerY, 6, FG);
+      gfx->drawCircle(waveX, centerY, 10, FG);
+    } else {
+      // Draw mute X (thick lines for better visibility)
+      uint16_t red = RGB(255, 0, 0);
+      int cx = x + VOL_ICON_W/2, cy = y + VOL_ICON_H/2;
+      // Draw thick X with multiple parallel lines
+      for (int i = -1; i <= 1; i++) {
+        gfx->drawLine(cx-8+i, cy-8, cx+8+i, cy+8, red);
+        gfx->drawLine(cx-8+i, cy+8, cx+8+i, cy-8, red);
+        gfx->drawLine(cx-8, cy-8+i, cx+8, cy+8+i, red);
+        gfx->drawLine(cx-8, cy+8+i, cx+8, cy-8+i, red);
+      }
+    }
+  }
 
   void drawTitle_() {
     const int maxW = 440; const int y_center = 240; const int gap = 6;
     // Title small font
     gfx->setFont(&FreeSansBold12pt7b); gfx->setTextColor(WHITE);
-    // Clear background band under text region based on bounds of a representative line
-    int16_t bx, by; uint16_t bw, bh; gfx->getTextBounds("Ay", 0, 0, &bx, &by, &bw, &bh);
-    int pad = 4; int tly = y_center - 24; int bandY = max(0, tly - pad); int bandH = min(480 - bandY, (int)bh*4 + 2*pad + 10);
-    gfx->fillRect(0, bandY, 480, bandH, RGB(10,10,10));
+    // Calculate overlay region for background restoration - MUCH LARGER AREA
+    // Cover the entire text overlay region generously to avoid text ghosting
+    int bandY = y_center - 80;  // Start well above text area
+    int bandH = 160;            // Cover 160 pixels height (enough for 4-6 lines)
+    if (bandY < 80) bandY = 80; // Don't overlap with header
+    if (bandY + bandH > 390) bandH = 390 - bandY; // Don't overlap with buttons
+    // Restore background in overlay region (instead of black band)
+    if (bg_) {
+      ui_gfx::Display disp(gfx);
+      bg_->blitRegion(disp, bandY, bandY + bandH - 1);
+    }
 
     auto wrap_and_draw = [&](String s, int y)->int{
       s.trim(); if (!s.length()) return 0; s = asciiFallback_(s);
@@ -126,14 +207,34 @@ private:
     int vol = volumeFn_ ? volumeFn_() : 0; bool muted = mutedFn_ ? mutedFn_() : false; int effective = muted ? 0 : vol; String room = asciiFallback_(roomFn_ ? roomFn_() : String());
     if (prevVol_ == effective && prevMuted_ == muted && prevRoom_ == room) return;
     prevVol_ = effective; prevMuted_ = muted; prevRoom_ = room;
-    const uint16_t header_bg = RGB(10,10,10); int band_y0 = 0; int band_h = 80; gfx->fillRect(0, band_y0, 480, band_h, header_bg);
+    const uint16_t header_bg = RGB(10,10,10); int band_y0 = 0; int band_h = 80;
+    // DON'T fill the entire header area - only draw backgrounds for specific elements
+    // gfx->fillRect(0, band_y0, 480, band_h, header_bg);  // REMOVED: This overwrites album art!
     char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%d%%", effective);
     gfx->setFont(&FreeSansBold18pt7b); int16_t tbx, tby; uint16_t tbw, tbh; gfx->getTextBounds(pbuf, 0, 0, &tbx, &tby, &tbw, &tbh);
     const int padding = 10; int total_w = VOL_ICON_W + padding + (int)tbw; int start_x = (480 - total_w) / 2;
+
+    // Update touch hit area (cover icon AND percentage text for easier mute toggle)
+    int hit_left = start_x - 40; if (hit_left < 0) hit_left = 0;
+    int hit_right = start_x + total_w + 20; if (hit_right > 480) hit_right = 480;
+    volHitX_ = hit_left; volHitY_ = 0; volHitW_ = hit_right - hit_left; volHitH_ = band_h;
+
+    // Draw background only for the volume icon and text area
+    int icon_bg_x = start_x - 5; int icon_bg_w = total_w + 10; int icon_bg_y = VOL_ICON_Y - 5; int icon_bg_h = VOL_ICON_H + 10;
+    gfx->fillRect(icon_bg_x, icon_bg_y, icon_bg_w, icon_bg_h, header_bg);
+
     gfx->setTextColor(WHITE, header_bg);
     int icon_x = start_x; drawSpeaker_(icon_x, VOL_ICON_Y, muted);
     int text_x = start_x + VOL_ICON_W + padding; int text_base_y = VOL_ICON_Y + (VOL_ICON_H + (int)tbh) / 2 - 2; gfx->setCursor(text_x, text_base_y); gfx->print(pbuf);
-    if (room.length()) { gfx->setFont(&FreeSansBold12pt7b); int16_t rbx, rby; uint16_t rbw, rbh; gfx->getTextBounds(room.c_str(),0,0,&rbx,&rby,&rbw,&rbh); int rx = 240 - (int)rbw/2; int ry = band_y0 + band_h - 10; gfx->setTextColor(WHITE, header_bg); gfx->setCursor(rx, ry); gfx->print(room); }
+
+    // Draw background only for the room name area
+    if (room.length()) {
+      gfx->setFont(&FreeSansBold12pt7b); int16_t rbx, rby; uint16_t rbw, rbh; gfx->getTextBounds(room.c_str(),0,0,&rbx,&rby,&rbw,&rbh);
+      int rx = 240 - (int)rbw/2; int ry = band_y0 + band_h - 10;
+      // Draw background only for room text
+      gfx->fillRect(rx - 5, ry - rbh - 2, rbw + 10, rbh + 4, header_bg);
+      gfx->setTextColor(WHITE, header_bg); gfx->setCursor(rx, ry); gfx->print(room);
+    }
   }
 
   void drawProgress_() {
@@ -153,6 +254,9 @@ private:
   std::function<bool()> isPlayingFn_; std::function<int()> volumeFn_; std::function<bool()> mutedFn_;
   std::function<int()> progressFn_; std::function<String()> titleFn_, artistFn_, roomFn_, relTimeFn_, durationFn_;
   int prevVol_ = -1; bool prevMuted_ = false; String prevRoom_;
+
+  // Touch hit areas (updated by drawVolume_)
+  mutable int volHitX_ = 0, volHitY_ = 0, volHitW_ = 0, volHitH_ = 0;
 };
 
 } // namespace ui

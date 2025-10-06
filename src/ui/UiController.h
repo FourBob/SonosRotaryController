@@ -15,6 +15,11 @@ public:
     if (current_) current_->enter();
   }
 
+  // Force refresh of current screen (calls enter() even if same screen)
+  void refreshScreen() {
+    if (current_) current_->enter();
+  }
+
   std::shared_ptr<IScreen> current() const { return current_; }
 
   void tick() { if (current_) current_->tick(); }
